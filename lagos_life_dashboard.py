@@ -170,6 +170,35 @@ const download = document.getElementById("download");
 let mode = "create";
 let lastAutoDownloadedJob = null;
 let currentPreviewId = null;
+let hideRestoredTransferResult = false;
+let initialStatusLoaded = false;
+
+async function requestCsvDownload() {
+  try {
+    const response = await fetch("/download");
+    if (!response.ok) {
+      const error = await response.json();
+      statusText.textContent = "Download unavailable: " + error.error;
+      return;
+    }
+    const blob = await response.blob();
+    const disposition = response.headers.get("Content-Disposition") || "";
+    const match = disposition.match(/filename="([^"]+)"/);
+    const filename = match ? match[1] : "lagos_life.csv";
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    download.hidden = true;
+    statusText.textContent = "CSV sent to the browser's downloads.";
+  } catch (error) {
+    statusText.textContent = "Download failed: " + error.message;
+  }
+}
 
 function setMode(selectedMode) {
   mode = selectedMode;
@@ -190,6 +219,14 @@ function setMode(selectedMode) {
 async function updateStatus() {
   const response = await fetch("/api/status");
   const data = await response.json();
+  if (
+    !initialStatusLoaded
+    && data.mode === "transfer"
+    && ["completed", "stopped", "error"].includes(data.status)
+  ) {
+    hideRestoredTransferResult = true;
+  }
+  initialStatusLoaded = true;
   const busy = data.status === "running" || data.status === "stopping" || data.status === "previewing";
   const previewing = data.status === "previewing";
   startButton.disabled = busy || previewing;
@@ -247,7 +284,9 @@ async function updateStatus() {
   messages.scrollTop = messages.scrollHeight;
   download.hidden = !data.has_csv;
   download.textContent = data.mode === "transfer" ? "Download transfer report" : data.mode === "filter" ? "Download filtered CSV" : "Download CSV";
-  renderTransferPreview(data.preview || []);
+  renderTransferPreview(
+    hideRestoredTransferResult ? [] : (data.preview || [])
+  );
   currentPreviewId = data.preview_id || null;
   if (data.mode === "filter" && data.preview?.length) {
     filterPreview.textContent = data.preview[0].message;
@@ -259,7 +298,7 @@ async function updateStatus() {
     && data.job_id !== lastAutoDownloadedJob
   ) {
     lastAutoDownloadedJob = data.job_id;
-    window.location.assign("/download");
+    requestCsvDownload();
   }
 }
 
@@ -366,6 +405,7 @@ previewTransferButton.addEventListener("click", async () => {
     statusText.textContent = "Choose a CSV and enter a recipient before previewing.";
     return;
   }
+  hideRestoredTransferResult = false;
   const formData = new FormData();
   formData.append("file", file);
   formData.append("recipient", recipientUsername.value.trim());
@@ -419,6 +459,10 @@ stopButton.addEventListener("click", async () => {
 createModeButton.addEventListener("click", () => setMode("create"));
 transferModeButton.addEventListener("click", () => setMode("transfer"));
 filterModeButton.addEventListener("click", () => setMode("filter"));
+download.addEventListener("click", event => {
+  event.preventDefault();
+  requestCsvDownload();
+});
 transferModeSelect.addEventListener("change", () => {
   customTargetPanel.hidden = transferModeSelect.value !== "custom";
 });
@@ -1020,7 +1064,12 @@ def download_csv():
         filename = job_state["csv_filename"]
         if not content or not filename:
             if job_state["csv_downloaded"]:
-                return jsonify(error="This run's CSV has already been downloaded."), 410
+                return jsonify(
+                    error=(
+                        "The dashboard already sent this run's CSV to the browser. "
+                        "Check the browser's downloads before trying again."
+                    )
+                ), 410
             return jsonify(error="The CSV is not ready yet."), 404
         job_state["csv_content"] = None
         job_state["csv_filename"] = None
