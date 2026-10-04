@@ -109,7 +109,7 @@ Upload a CSV with the exact header and column order above, then enter the recipi
 | ₦96,000 balance | Exactly ₦96,000 | ₦91,000 |
 | Custom total recipient amount | Accounts in any of the three tiers | Allocation toward a target from ₦100,000 to ₦10,000,000 |
 
-For each fixed mode, only matching listed-balance rows are included. The custom mode uses only the ₦1,096,000, ₦500,000, and ₦96,000 tiers, prioritizing accounts in that order. It can assign a smaller final amount when needed to approach the target; allocations use ₦1,000 increments. At most 25 accounts are included.
+For each fixed mode, only matching listed-balance rows are included. The custom mode uses only the ₦1,096,000, ₦500,000, and ₦96,000 tiers, prioritizing accounts in that order. It can assign a smaller final amount when needed to approach the target; allocations use ₦1,000 increments. There is no eligible-account row-count cap. The dashboard still limits each uploaded request to 256 KiB.
 
 The custom target is the amount intended to reach the recipient; fees are additional. The custom preview displays the live balance and the fee shown by the website for each account and blocks an account if its current balance does not cover the transfer plus fee. After those live checks, the dashboard updates the planned amount and remainder based on accounts marked ready. If some accounts are blocked, the plan may fall short; it does not automatically replace them with other accounts.
 
@@ -123,7 +123,7 @@ Transfer steps:
 
 The fee is read from the transfer form at preview time. The confirmed run opens the form again, rechecks the live balance and fee, and will skip the transfer if the live balance no longer covers the transfer plus fee.
 
-At most two accounts are processed concurrently. If a transfer has an uncertain result, the dashboard flags it and stops scheduling new accounts. Other transfers already in flight may still finish. **Do not retry an uncertain account until you have checked its transfer history and balance**, because a retry could duplicate a transfer.
+Up to two accounts are processed concurrently during preview and transfer. If a transfer has an uncertain result, the dashboard flags it and stops scheduling new accounts. Other transfers already in flight may still finish. **Do not retry an uncertain account until you have checked its transfer history and balance**, because a retry could duplicate a transfer.
 
 ## CSV handling and sensitive data
 

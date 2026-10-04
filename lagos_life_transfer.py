@@ -24,7 +24,6 @@ ALLOWED_TRANSFER_AMOUNTS = frozenset(
     {config["transfer_amount"] for config in TRANSFER_MODES.values()}
     | set(range(1_000, 10_000_001, 1_000))
 )
-MAX_TRANSFER_ACCOUNTS = 25
 MAX_CONCURRENT_TRANSFERS = 2
 
 
@@ -382,10 +381,8 @@ def run_transfers(
     recipient = recipient.strip().lstrip("@")
     if not recipient or not re.fullmatch(r"[A-Za-z0-9_.-]+", recipient):
         raise ValueError("Recipient must contain only letters, numbers, _, . or -.")
-    if not 1 <= len(accounts) <= MAX_TRANSFER_ACCOUNTS:
-        raise ValueError(
-            f"Upload between 1 and {MAX_TRANSFER_ACCOUNTS} accounts."
-        )
+    if not accounts:
+        raise ValueError("Upload at least one eligible account.")
     for account in accounts:
         _account_transfer_amount(account, transfer_amount)
 

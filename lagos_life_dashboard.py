@@ -13,7 +13,6 @@ from lagos_life_automation_multi import (
     run_accounts,
 )
 from lagos_life_transfer import (
-    MAX_TRANSFER_ACCOUNTS,
     MINIMUM_LISTED_BALANCE,
     TRANSFER_MODES,
     preview_transfers,
@@ -90,7 +89,7 @@ PAGE = """
   <input id="count" type="number" min="1" max="{{ maximum }}" value="{{ default_count }}">
   </section>
   <section id="transferPanel" hidden>
-  <p>Upload a CSV with exactly these columns, in this order: name,username,password,balance. The fixed modes use matching listed balances; custom target uses only supported tiers, prioritizing ₦1,096,000, then ₦500,000, then ₦96,000 accounts. The live balance and fee are checked before confirmation. Up to {{ max_transfer_accounts }} accounts may be used.</p>
+  <p>Upload a CSV with exactly these columns, in this order: name,username,password,balance. The fixed modes use matching listed balances; custom target uses only supported tiers, prioritizing ₦1,096,000, then ₦500,000, then ₦96,000 accounts. The live balance and fee are checked before confirmation. There is no eligible-account row-count cap; three browser sessions run concurrently.</p>
   <label for="transferModeSelect">Balance and transfer amount</label>
   <select id="transferModeSelect">
     <option value="1096k">₦1,096,000 balance → send ₦1,000,000</option>
@@ -108,6 +107,7 @@ PAGE = """
   <label for="csvFile">Account CSV</label>
   <input id="csvFile" type="file" accept=".csv,text/csv">
   <button id="previewTransfer" type="button">Preview transfer</button>
+  <p id="transferPreviewError" role="alert" hidden></p>
   <label id="transferConfirmLabel" for="transferConfirm" hidden><input id="transferConfirm" type="checkbox"> I reviewed the rows, recipient, exact amount, displayed fees, and balances; submit the ready transfers. Transfers cannot be undone.</label>
   <div id="transferPreview"></div>
   <p class="warning">Transfers can incur fees and may not be reversible. Login details are kept in memory only for this run and are not included in its report.</p>
@@ -158,6 +158,7 @@ const recipientUsername = document.getElementById("recipientUsername");
 const previewTransferButton = document.getElementById("previewTransfer");
 const previewFilterButton = document.getElementById("previewFilter");
 const transferPreview = document.getElementById("transferPreview");
+const transferPreviewError = document.getElementById("transferPreviewError");
 const filterPreview = document.getElementById("filterPreview");
 const downloadMode = document.getElementById("downloadMode");
 const statusText = document.getElementById("status");
@@ -400,9 +401,14 @@ startButton.addEventListener("click", async () => {
 previewTransferButton.addEventListener("click", async () => {
   transferConfirm.checked = false;
   transferPreview.replaceChildren();
+  transferPreviewError.hidden = true;
+  transferPreviewError.textContent = "";
+  currentPreviewId = null;
+  hideRestoredTransferResult = true;
   const file = csvFile.files[0];
   if (!file || !recipientUsername.value.trim()) {
-    statusText.textContent = "Choose a CSV and enter a recipient before previewing.";
+    transferPreviewError.textContent = "Choose a CSV and enter a recipient before previewing.";
+    transferPreviewError.hidden = false;
     return;
   }
   hideRestoredTransferResult = false;
@@ -414,16 +420,25 @@ previewTransferButton.addEventListener("click", async () => {
     formData.append("target_amount", customTargetAmount.value);
   }
   formData.append("download_mode", downloadMode.value);
-  const response = await fetch("/api/preview-transfer", {
-    method: "POST",
-    headers: {"X-LagosLife-Local": "1"},
-    body: formData
-  });
-  if (!response.ok) {
-    const error = await response.json();
-    statusText.textContent = "Preview failed: " + error.error;
+  try {
+    const response = await fetch("/api/preview-transfer", {
+      method: "POST",
+      headers: {"X-LagosLife-Local": "1"},
+      body: formData
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      await updateStatus();
+      transferPreviewError.textContent = `Preview failed (${response.status}): ${result.error}`;
+      transferPreviewError.hidden = false;
+      return;
+    }
+    hideRestoredTransferResult = false;
+    await updateStatus();
+  } catch (error) {
+    transferPreviewError.textContent = "Preview failed: " + error.message;
+    transferPreviewError.hidden = false;
   }
-  await updateStatus();
 });
 
 previewFilterButton.addEventListener("click", async () => {
@@ -436,16 +451,22 @@ previewFilterButton.addEventListener("click", async () => {
   const formData = new FormData();
   formData.append("file", filterCsvFile.files[0]);
   formData.append("download_mode", downloadMode.value);
-  const response = await fetch("/api/preview-filter", {
-    method: "POST",
-    headers: {"X-LagosLife-Local": "1"},
-    body: formData
-  });
-  if (!response.ok) {
-    const error = await response.json();
-    filterPreview.textContent = "Preview failed: " + error.error;
+  try {
+    const response = await fetch("/api/preview-filter", {
+      method: "POST",
+      headers: {"X-LagosLife-Local": "1"},
+      body: formData
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      await updateStatus();
+      filterPreview.textContent = `Preview failed (${response.status}): ${result.error}`;
+      return;
+    }
+    await updateStatus();
+  } catch (error) {
+    filterPreview.textContent = "Preview failed: " + error.message;
   }
-  await updateStatus();
 });
 
 stopButton.addEventListener("click", async () => {
@@ -492,7 +513,6 @@ def index():
         maximum=MAX_ACCOUNTS_PER_SESSION,
         default_count=NUM_ACCOUNTS,
         minimum_balance=f"{MINIMUM_LISTED_BALANCE:,}",
-        max_transfer_accounts=MAX_TRANSFER_ACCOUNTS,
     )
 
 
@@ -616,10 +636,6 @@ def parse_account_csv(file_storage, listed_balance=MINIMUM_LISTED_BALANCE):
         if not accepted_balance:
             continue
         eligible_accounts.append(account)
-    if len(eligible_accounts) > MAX_TRANSFER_ACCOUNTS:
-        raise ValueError(
-            f"At most {MAX_TRANSFER_ACCOUNTS} rows may qualify for transfer."
-        )
     return [
         {key: account[key] for key in ("name", "username", "password", "balance")}
         for account in eligible_accounts
@@ -781,6 +797,21 @@ def confirm_filter():
 @app.post("/api/preview-transfer")
 def preview_transfer():
     global pending_operation
+    with state_lock:
+        if job_state["status"] in ("running", "stopping", "previewing"):
+            return jsonify(error="Another operation is already active."), 409
+        pending_operation = None
+        job_state.update({
+            "mode": "transfer",
+            "status": "idle",
+            "preview": [],
+            "preview_id": None,
+            "transfer_target": None,
+            "transfer_planned": None,
+            "transfer_remainder": None,
+            "messages": ["Validating the selected transfer CSV."],
+        })
+
     uploaded_file = request.files.get("file")
     recipient = request.form.get("recipient", "").strip().lstrip("@")
     balance_mode = request.form.get("balance_mode", "500k")
@@ -840,8 +871,6 @@ def preview_transfer():
         )
     preview_messages.append("No transfers are being submitted during preview.")
     with state_lock:
-        if job_state["status"] in ("running", "stopping", "previewing"):
-            return jsonify(error="Another operation is already active."), 409
         pending_operation = {
             "kind": "transfer",
             "preview_id": preview_id,
