@@ -43,6 +43,9 @@ job_state = {
     "download_mode": "manual",
     "preview": [],
     "preview_id": None,
+    "transfer_target": None,
+    "transfer_planned": None,
+    "transfer_remainder": None,
     "uncertain": 0,
     "error": None,
 }
@@ -87,12 +90,18 @@ PAGE = """
   <input id="count" type="number" min="1" max="{{ maximum }}" value="{{ default_count }}">
   </section>
   <section id="transferPanel" hidden>
-  <p>Upload a CSV with exactly these columns, in this order: name,username,password,balance. Choose a balance mode; only matching listed balances are included. The script checks each live balance and the displayed fee before submission.</p>
+  <p>Upload a CSV with exactly these columns, in this order: name,username,password,balance. The fixed modes use matching listed balances; custom target uses only ₦500,000 and ₦96,000 tier accounts, prioritizing ₦500,000 accounts. The live balance and fee are checked before confirmation. Up to {{ max_transfer_accounts }} accounts may be used.</p>
   <label for="transferModeSelect">Balance and transfer amount</label>
   <select id="transferModeSelect">
     <option value="500k" selected>₦500,000 balance → send ₦475,000</option>
     <option value="96k">₦96,000 balance → send ₦91,000</option>
+    <option value="custom">Custom total recipient amount</option>
   </select>
+  <div id="customTargetPanel" hidden>
+    <label for="customTargetAmount">Recipient target (₦100,000–₦10,000,000)</label>
+    <input id="customTargetAmount" type="number" min="100000" max="10000000" step="1" value="100000">
+    <p>Allocates in ₦1,000 increments, prioritizing ₦500,000 accounts. If the full target is unavailable, the preview shows the planned amount and remainder.</p>
+  </div>
   <label for="recipientUsername">Recipient username</label>
   <input id="recipientUsername" type="text" maxlength="40" autocomplete="off" placeholder="Enter recipient username">
   <label for="csvFile">Account CSV</label>
@@ -139,6 +148,8 @@ const transferPanel = document.getElementById("transferPanel");
 const filterPanel = document.getElementById("filterPanel");
 const csvFile = document.getElementById("csvFile");
 const transferModeSelect = document.getElementById("transferModeSelect");
+const customTargetPanel = document.getElementById("customTargetPanel");
+const customTargetAmount = document.getElementById("customTargetAmount");
 const filterCsvFile = document.getElementById("filterCsvFile");
 const transferConfirm = document.getElementById("transferConfirm");
 const transferConfirmLabel = document.getElementById("transferConfirmLabel");
@@ -199,6 +210,7 @@ async function updateStatus() {
   csvFile.disabled = busy;
   recipientUsername.disabled = busy;
   transferModeSelect.disabled = busy;
+  customTargetAmount.disabled = busy;
   filterCsvFile.disabled = busy;
   transferConfirm.disabled = busy;
   previewTransferButton.disabled = busy || previewing;
@@ -221,6 +233,11 @@ async function updateStatus() {
   } else {
     summary.textContent = `${data.completed} finished, ${data.failed} failed; `
       + `${data.active_accounts.length} active`;
+  }
+  if (data.mode === "transfer" && data.transfer_target !== null) {
+    summary.textContent += `; target ₦${Number(data.transfer_target).toLocaleString()}, `
+      + `planned ₦${Number(data.transfer_planned).toLocaleString()}, `
+      + `remainder ₦${Number(data.transfer_remainder).toLocaleString()}`;
   }
   if (data.uncertain) {
     summary.textContent += `; ${data.uncertain} uncertain — do not retry without checking`;
@@ -352,6 +369,9 @@ previewTransferButton.addEventListener("click", async () => {
   formData.append("file", file);
   formData.append("recipient", recipientUsername.value.trim());
   formData.append("balance_mode", transferModeSelect.value);
+  if (transferModeSelect.value === "custom") {
+    formData.append("target_amount", customTargetAmount.value);
+  }
   formData.append("download_mode", downloadMode.value);
   const response = await fetch("/api/preview-transfer", {
     method: "POST",
@@ -398,6 +418,9 @@ stopButton.addEventListener("click", async () => {
 createModeButton.addEventListener("click", () => setMode("create"));
 transferModeButton.addEventListener("click", () => setMode("transfer"));
 filterModeButton.addEventListener("click", () => setMode("filter"));
+transferModeSelect.addEventListener("change", () => {
+  customTargetPanel.hidden = transferModeSelect.value !== "custom";
+});
 setMode("create");
 updateStatus();
 setInterval(updateStatus, 1000);
@@ -424,6 +447,7 @@ def index():
         maximum=MAX_ACCOUNTS_PER_SESSION,
         default_count=NUM_ACCOUNTS,
         minimum_balance=f"{MINIMUM_LISTED_BALANCE:,}",
+        max_transfer_accounts=MAX_TRANSFER_ACCOUNTS,
     )
 
 
@@ -537,7 +561,14 @@ def parse_account_csv(file_storage, listed_balance=MINIMUM_LISTED_BALANCE):
                 f"CSV row {row_number} repeats username {account['username']!r}."
             )
         usernames.add(account["username"])
-        if account["parsed_balance"] != listed_balance:
+        accepted_balance = (
+            account["parsed_balance"] in {
+                config["listed_balance"] for config in TRANSFER_MODES.values()
+            }
+            if listed_balance is None
+            else account["parsed_balance"] == listed_balance
+        )
+        if not accepted_balance:
             continue
         eligible_accounts.append(account)
     if len(eligible_accounts) > MAX_TRANSFER_ACCOUNTS:
@@ -548,6 +579,45 @@ def parse_account_csv(file_storage, listed_balance=MINIMUM_LISTED_BALANCE):
         {key: account[key] for key in ("name", "username", "password", "balance")}
         for account in eligible_accounts
     ], len(accounts) - len(eligible_accounts)
+
+
+def allocate_custom_transfer(accounts, target_amount):
+    if (
+        isinstance(target_amount, bool)
+        or not isinstance(target_amount, int)
+        or not 100_000 <= target_amount <= 10_000_000
+    ):
+        raise ValueError("Custom target must be a whole Naira amount from ₦100,000 to ₦10,000,000.")
+
+    capacities = {
+        config["listed_balance"]: config["transfer_amount"]
+        for config in TRANSFER_MODES.values()
+    }
+    ordered_accounts = sorted(
+        accounts,
+        key=lambda account: (
+            0 if parse_balance_value(account["balance"]) == 500_000 else 1
+        ),
+    )
+    allocations = []
+    remaining = target_amount
+
+    for account in ordered_accounts:
+        if remaining < 1_000:
+            break
+        listed_balance = int(parse_balance_value(account["balance"]))
+        capacity = capacities.get(listed_balance)
+        if capacity is None:
+            continue
+        amount = min(capacity, remaining)
+        amount -= amount % 1_000
+        if amount <= 0:
+            continue
+        allocations.append({**account, "transfer_amount": amount})
+        remaining -= amount
+
+    planned_amount = target_amount - remaining
+    return allocations, planned_amount, remaining
 
 
 def parse_balance_value(value):
@@ -669,11 +739,22 @@ def preview_transfer():
     uploaded_file = request.files.get("file")
     recipient = request.form.get("recipient", "").strip().lstrip("@")
     balance_mode = request.form.get("balance_mode", "500k")
-    if balance_mode not in TRANSFER_MODES:
+    if balance_mode not in (*TRANSFER_MODES, "custom"):
         return jsonify(error="Choose a supported balance and transfer mode."), 400
-    mode_config = TRANSFER_MODES[balance_mode]
-    listed_balance = mode_config["listed_balance"]
-    transfer_amount = mode_config["transfer_amount"]
+    target_amount = None
+    if balance_mode == "custom":
+        try:
+            target_amount = int(request.form.get("target_amount", ""))
+        except ValueError:
+            return jsonify(error="Enter a whole Naira target from ₦100,000 to ₦10,000,000."), 400
+        if not 100_000 <= target_amount <= 10_000_000:
+            return jsonify(error="Custom target must be from ₦100,000 to ₦10,000,000."), 400
+        listed_balance = None
+        transfer_amount = TRANSFER_MODES["500k"]["transfer_amount"]
+    else:
+        mode_config = TRANSFER_MODES[balance_mode]
+        listed_balance = mode_config["listed_balance"]
+        transfer_amount = mode_config["transfer_amount"]
     if uploaded_file is None or not uploaded_file.filename:
         return jsonify(error="Choose a CSV file first."), 400
     if not recipient or not re.fullmatch(r"[A-Za-z0-9_.-]+", recipient):
@@ -682,16 +763,37 @@ def preview_transfer():
         accounts, excluded_count = parse_account_csv(uploaded_file, listed_balance)
     except ValueError as error:
         return jsonify(error=str(error)), 400
+    if balance_mode == "custom":
+        accounts, planned_amount, remainder = allocate_custom_transfer(
+            accounts, target_amount
+        )
+    else:
+        planned_amount = None
+        remainder = None
     if not accounts:
-        return jsonify(
-            error=f"No CSV accounts have the exact ₦{listed_balance:,} listed balance."
-        ), 400
+        if balance_mode == "custom":
+            return jsonify(error="No eligible CSV accounts can contribute to the custom target."), 400
+        return jsonify(error=f"No CSV accounts have the exact ₦{listed_balance:,} listed balance."), 400
     download_mode = request.form.get("download_mode", "manual")
     if download_mode not in ("manual", "automatic"):
         return jsonify(error="Download mode must be manual or automatic."), 400
 
     preview_id = secrets.token_urlsafe(24)
     job_id = secrets.token_urlsafe(12)
+    preview_messages = [
+        f"Checking {len(accounts)} eligible account(s) two at a time.",
+        (
+            f"Skipped {excluded_count} row(s) outside the selected balance mode."
+            if balance_mode == "custom"
+            else f"Skipped {excluded_count} row(s) that do not have exactly ₦{listed_balance:,} listed balance."
+        ),
+    ]
+    if target_amount is not None:
+        preview_messages.append(
+            f"Target ₦{target_amount:,}; allocated ₦{planned_amount:,}, "
+            f"remainder ₦{remainder:,} before live fee checks."
+        )
+    preview_messages.append("No transfers are being submitted during preview.")
     with state_lock:
         if job_state["status"] in ("running", "stopping", "previewing"):
             return jsonify(error="Another operation is already active."), 409
@@ -704,6 +806,9 @@ def preview_transfer():
             "balance_mode": balance_mode,
             "listed_balance": listed_balance,
             "transfer_amount": transfer_amount,
+            "target_amount": target_amount,
+            "planned_amount": planned_amount,
+            "remainder": remainder,
             "download_mode": download_mode,
             "excluded_count": excluded_count,
         }
@@ -719,11 +824,10 @@ def preview_transfer():
             "active_accounts": [],
             "preview": [],
             "preview_id": preview_id,
-            "messages": [
-                f"Checking {len(accounts)} eligible account(s) two at a time.",
-                f"Skipped {excluded_count} row(s) that do not have exactly ₦{listed_balance:,} listed balance.",
-                "No transfers are being submitted during preview.",
-            ],
+            "transfer_target": target_amount,
+            "transfer_planned": planned_amount,
+            "transfer_remainder": remainder,
+            "messages": preview_messages,
             "csv_content": None,
             "csv_filename": None,
             "csv_downloaded": False,
@@ -732,14 +836,16 @@ def preview_transfer():
         })
         worker = threading.Thread(
             target=run_transfer_preview,
-            args=(job_id, preview_id, accounts, recipient, transfer_amount),
+            args=(job_id, preview_id, accounts, recipient, transfer_amount, target_amount),
             daemon=True,
         )
         worker.start()
     return jsonify(status="previewing", preview_id=preview_id), 202
 
 
-def run_transfer_preview(job_id, preview_id, accounts, recipient, transfer_amount):
+def run_transfer_preview(
+    job_id, preview_id, accounts, recipient, transfer_amount, target_amount
+):
     global pending_operation
 
     def record_event(event):
@@ -761,7 +867,7 @@ def run_transfer_preview(job_id, preview_id, accounts, recipient, transfer_amoun
                     "account_number": number,
                     "username": event.get("username", ""),
                     "recipient": recipient,
-                    "amount": f"₦{transfer_amount:,}",
+                    "amount": event.get("amount", f"₦{transfer_amount:,}"),
                     "fee": event.get("fee", "Unknown"),
                     "balance": event.get("balance", "Unknown"),
                     "total": event.get("total", "Unknown"),
@@ -799,6 +905,20 @@ def run_transfer_preview(job_id, preview_id, accounts, recipient, transfer_amoun
         job_state["active_accounts"] = []
         job_state["status"] = "preview_ready"
         ready_count = sum(row["status"] == "ready" for row in previews)
+        if target_amount is not None:
+            live_planned = sum(
+                int(parse_balance_value(row["amount"]))
+                for row in previews
+                if row["status"] == "ready"
+            )
+            job_state["transfer_planned"] = live_planned
+            job_state["transfer_remainder"] = target_amount - live_planned
+            pending_operation["planned_amount"] = live_planned
+            pending_operation["remainder"] = target_amount - live_planned
+            job_state["messages"].append(
+                f"After live fee and balance checks: ₦{live_planned:,} planned "
+                f"toward ₦{target_amount:,}; remainder ₦{target_amount-live_planned:,}."
+            )
         job_state["messages"].append(
             f"Preview complete: {ready_count} ready, "
             f"{len(previews) - ready_count} blocked. Review each fee before confirming."
@@ -849,7 +969,12 @@ def confirm_transfer():
             "uncertain": 0,
             "active_accounts": [],
             "messages": [
-                f"Submitting transfers for {len(accounts)} preview-approved account(s).",
+                (
+                    f"Submitting ₦{pending['planned_amount']:,} across "
+                    f"{len(accounts)} preview-approved account(s)."
+                    if pending.get("target_amount") is not None
+                    else f"Submitting transfers for {len(accounts)} preview-approved account(s)."
+                ),
                 "Uncertain transfers are not retried automatically.",
             ],
             "csv_content": None,
@@ -1023,6 +1148,11 @@ def run_job(
                 job_state["messages"].append("CSV is ready in memory for download.")
             else:
                 job_state["messages"].append("No CSV was generated for this run.")
+            if mode == "transfer" and result.get("stopped_for_uncertain"):
+                job_state["messages"].append(
+                    "Stopped scheduling new transfers after an uncertain result. "
+                    f"{result['not_started']} account(s) were not started; verify outcomes before continuing."
+                )
             if mode == "create":
                 job_state["messages"].append(
                     f"Account summary: {result['successful']} succeeded, "

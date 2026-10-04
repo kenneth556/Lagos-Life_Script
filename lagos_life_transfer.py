@@ -19,7 +19,11 @@ TRANSFER_MODES = {
     "500k": {"listed_balance": 500_000, "transfer_amount": 475_000},
     "96k": {"listed_balance": 96_000, "transfer_amount": 91_000},
 }
-MAX_TRANSFER_ACCOUNTS = 20
+ALLOWED_TRANSFER_AMOUNTS = frozenset(
+    {config["transfer_amount"] for config in TRANSFER_MODES.values()}
+    | set(range(1_000, 10_000_001, 1_000))
+)
+MAX_TRANSFER_ACCOUNTS = 25
 MAX_CONCURRENT_TRANSFERS = 2
 
 
@@ -41,7 +45,23 @@ def _visible_fee(button_text):
     return float(match.group(1).replace(",", ""))
 
 
+def _validate_transfer_amount(transfer_amount):
+    if (
+        isinstance(transfer_amount, bool)
+        or not isinstance(transfer_amount, int)
+        or transfer_amount not in ALLOWED_TRANSFER_AMOUNTS
+    ):
+        raise ValueError("Transfer amount must match a supported balance mode.")
+
+
+def _account_transfer_amount(account, default_amount):
+    transfer_amount = account.get("transfer_amount", default_amount)
+    _validate_transfer_amount(transfer_amount)
+    return transfer_amount
+
+
 def _open_transfer_form(account, recipient, transfer_amount=TRANSFER_AMOUNT):
+    _validate_transfer_amount(transfer_amount)
     options = Options()
     options.add_argument("--start-maximized")
     driver = webdriver.Chrome(options=options)
@@ -198,6 +218,9 @@ def preview_transfer_from_account(account, recipient, transfer_amount=TRANSFER_A
 def preview_transfers(
     accounts, recipient, progress_callback=None, transfer_amount=TRANSFER_AMOUNT
 ):
+    _validate_transfer_amount(transfer_amount)
+    for account in accounts:
+        _account_transfer_amount(account, transfer_amount)
     recipient = recipient.strip().lstrip("@")
     if not recipient or not re.fullmatch(r"[A-Za-z0-9_.-]+", recipient):
         raise ValueError("Recipient must contain only letters, numbers, _, . or -.")
@@ -211,7 +234,7 @@ def preview_transfers(
                 preview_transfer_from_account,
                 accounts[next_index],
                 recipient,
-                transfer_amount,
+                _account_transfer_amount(accounts[next_index], transfer_amount),
             )
             futures[future] = next_index
             if progress_callback:
@@ -245,6 +268,7 @@ def preview_transfers(
                         "type": "account_completed",
                         "account_number": index + 1,
                         "username": preview["username"],
+                        "amount": preview["amount"],
                         "fee": preview["fee"] or "Unknown",
                         "balance": preview["balance"] or "Unknown",
                         "total": preview["total"] or "Unknown",
@@ -260,7 +284,7 @@ def preview_transfers(
                     preview_transfer_from_account,
                     accounts[next_index],
                     recipient,
-                    transfer_amount,
+                    _account_transfer_amount(accounts[next_index], transfer_amount),
                 )
                 futures[future] = next_index
                 if progress_callback:
@@ -350,6 +374,7 @@ def run_transfers(
     stop_event=None,
     transfer_amount=TRANSFER_AMOUNT,
 ):
+    _validate_transfer_amount(transfer_amount)
     recipient = recipient.strip().lstrip("@")
     if not recipient or not re.fullmatch(r"[A-Za-z0-9_.-]+", recipient):
         raise ValueError("Recipient must contain only letters, numbers, _, . or -.")
@@ -357,10 +382,13 @@ def run_transfers(
         raise ValueError(
             f"Upload between 1 and {MAX_TRANSFER_ACCOUNTS} accounts."
         )
+    for account in accounts:
+        _account_transfer_amount(account, transfer_amount)
 
     results = {}
     futures = {}
     next_index = 0
+    stopped_for_uncertain = False
 
     with ThreadPoolExecutor(max_workers=MAX_CONCURRENT_TRANSFERS) as executor:
         while next_index < len(accounts) and len(futures) < MAX_CONCURRENT_TRANSFERS:
@@ -370,7 +398,7 @@ def run_transfers(
                 transfer_from_account,
                 accounts[next_index],
                 recipient,
-                transfer_amount,
+                _account_transfer_amount(accounts[next_index], transfer_amount),
             )
             futures[future] = next_index
             if progress_callback:
@@ -389,19 +417,28 @@ def run_transfers(
                 try:
                     result = future.result()
                 except Exception as error:
+                    amount = _account_transfer_amount(
+                        accounts[index], transfer_amount
+                    )
                     result = {
                         "name": accounts[index]["name"],
                         "username": accounts[index]["username"],
-                        "amount": f"₦{transfer_amount:,}",
-                        "status": "failed",
-                        "message": f"{type(error).__name__}: {error}",
+                        "amount": f"₦{amount:,}",
+                        "status": "uncertain",
+                        "message": (
+                            "Unexpected transfer error; verify the account before "
+                            f"continuing. {type(error).__name__}: {error}"
+                        ),
                     }
                 results[account_number] = result
+                if result["status"] == "uncertain":
+                    stopped_for_uncertain = True
                 if progress_callback:
                     progress_callback({
                         "type": "account_completed",
                         "account_number": account_number,
                         "username": result["username"],
+                        "amount": result["amount"],
                         "status": result["status"],
                         "message": result["message"],
                     })
@@ -409,13 +446,14 @@ def run_transfers(
             while (
                 next_index < len(accounts)
                 and len(futures) < MAX_CONCURRENT_TRANSFERS
+                and not stopped_for_uncertain
                 and (stop_event is None or not stop_event.is_set())
             ):
                 future = executor.submit(
                     transfer_from_account,
                     accounts[next_index],
                     recipient,
-                    transfer_amount,
+                    _account_transfer_amount(accounts[next_index], transfer_amount),
                 )
                 futures[future] = next_index
                 if progress_callback:
@@ -439,6 +477,11 @@ def run_transfers(
         "results": transfer_results,
         "csv_content": "\ufeff" + report_buffer.getvalue(),
         "csv_filename": report_filename,
-        "stopped": stop_event is not None and stop_event.is_set(),
+        "stopped": (
+            stopped_for_uncertain
+            or (stop_event is not None and stop_event.is_set())
+        ),
+        "stopped_for_uncertain": stopped_for_uncertain,
+        "not_started": len(accounts) - next_index,
         "requested": len(accounts),
     }
