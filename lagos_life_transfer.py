@@ -16,6 +16,7 @@ SITE_URL = "https://lagoslife.eliysites.com/"
 TRANSFER_AMOUNT = 475_000
 MINIMUM_LISTED_BALANCE = 500_000
 TRANSFER_MODES = {
+    "1096k": {"listed_balance": 1_096_000, "transfer_amount": 1_000_000},
     "500k": {"listed_balance": 500_000, "transfer_amount": 475_000},
     "96k": {"listed_balance": 96_000, "transfer_amount": 91_000},
 }
@@ -252,10 +253,13 @@ def preview_transfers(
                 try:
                     preview = future.result()
                 except Exception as error:
+                    amount = _account_transfer_amount(
+                        accounts[index], transfer_amount
+                    )
                     preview = {
                         "name": accounts[index]["name"],
                         "username": accounts[index]["username"],
-                        "amount": f"₦{transfer_amount:,}",
+                        "amount": f"₦{amount:,}",
                         "fee": None,
                         "balance": None,
                         "total": None,

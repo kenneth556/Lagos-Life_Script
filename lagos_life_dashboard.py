@@ -90,9 +90,10 @@ PAGE = """
   <input id="count" type="number" min="1" max="{{ maximum }}" value="{{ default_count }}">
   </section>
   <section id="transferPanel" hidden>
-  <p>Upload a CSV with exactly these columns, in this order: name,username,password,balance. The fixed modes use matching listed balances; custom target uses only ₦500,000 and ₦96,000 tier accounts, prioritizing ₦500,000 accounts. The live balance and fee are checked before confirmation. Up to {{ max_transfer_accounts }} accounts may be used.</p>
+  <p>Upload a CSV with exactly these columns, in this order: name,username,password,balance. The fixed modes use matching listed balances; custom target uses only supported tiers, prioritizing ₦1,096,000, then ₦500,000, then ₦96,000 accounts. The live balance and fee are checked before confirmation. Up to {{ max_transfer_accounts }} accounts may be used.</p>
   <label for="transferModeSelect">Balance and transfer amount</label>
   <select id="transferModeSelect">
+    <option value="1096k">₦1,096,000 balance → send ₦1,000,000</option>
     <option value="500k" selected>₦500,000 balance → send ₦475,000</option>
     <option value="96k">₦96,000 balance → send ₦91,000</option>
     <option value="custom">Custom total recipient amount</option>
@@ -100,7 +101,7 @@ PAGE = """
   <div id="customTargetPanel" hidden>
     <label for="customTargetAmount">Recipient target (₦100,000–₦10,000,000)</label>
     <input id="customTargetAmount" type="number" min="100000" max="10000000" step="1" value="100000">
-    <p>Allocates in ₦1,000 increments, prioritizing ₦500,000 accounts. If the full target is unavailable, the preview shows the planned amount and remainder.</p>
+    <p>Allocates in ₦1,000 increments, prioritizing ₦1,096,000, then ₦500,000, then ₦96,000 accounts. If the full target is unavailable, the preview shows the planned amount and remainder.</p>
   </div>
   <label for="recipientUsername">Recipient username</label>
   <input id="recipientUsername" type="text" maxlength="40" autocomplete="off" placeholder="Enter recipient username">
@@ -596,7 +597,7 @@ def allocate_custom_transfer(accounts, target_amount):
     ordered_accounts = sorted(
         accounts,
         key=lambda account: (
-            0 if parse_balance_value(account["balance"]) == 500_000 else 1
+            -capacities.get(int(parse_balance_value(account["balance"])), 0)
         ),
     )
     allocations = []
