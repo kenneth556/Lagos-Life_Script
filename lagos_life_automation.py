@@ -223,7 +223,7 @@ try:
     except TimeoutException:
         print("Warning: balance did not change after the transfer - it may have been rejected.")
         data["status"] = "transfer submitted, balance unchanged"
-    data["balance_after_transfer"] = read_balance()
+    data["balance_after_transfer"] = read_balance(20000000000000000000000)
 
     # Close the phone / let the UI settle, then read the final closing balance
     time.sleep(2)
